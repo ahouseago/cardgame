@@ -15,7 +15,7 @@ type State =
 type ConnectionMsg {
   Create(mist.WebsocketConnection)
   Delete(Int)
-  Broadcast(String)
+  Receive(String)
 }
 
 pub fn main() {
@@ -67,7 +67,8 @@ fn handle_message(
     Delete(id) ->
       dict.delete(state, id)
       |> actor.continue
-    Broadcast(text) -> {
+    Receive(text) -> {
+      // Send to all connected websockets
       let assert Ok(_) =
         dict.values(state)
         |> list.try_each(fn(conn) { mist.send_text_frame(conn, text) })
@@ -76,7 +77,7 @@ fn handle_message(
   }
 }
 
-fn handle_ws_message(state, conn, message: mist.WebsocketMessage(ConnectionMsg)) {
+fn handle_ws_message(state, conn, message) {
   case message {
     mist.Text("ping") -> {
       let assert Ok(_) = mist.send_text_frame(conn, "pong")
@@ -84,14 +85,10 @@ fn handle_ws_message(state, conn, message: mist.WebsocketMessage(ConnectionMsg))
     }
     mist.Text(text) -> {
       io.println("Received message: " <> text)
-      actor.send(state, Broadcast(text))
+      actor.send(state, Receive(text))
       actor.continue(state)
     }
     mist.Binary(_) -> {
-      actor.continue(state)
-    }
-    mist.Custom(Broadcast(text)) -> {
-      let assert Ok(_) = mist.send_text_frame(conn, text)
       actor.continue(state)
     }
     mist.Custom(_) -> {
