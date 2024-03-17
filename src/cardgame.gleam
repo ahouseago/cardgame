@@ -5,6 +5,7 @@ import gleam/erlang/process
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/io
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{Some}
@@ -18,7 +19,7 @@ type State =
 type ConnectionMsg {
   Create(mist.WebsocketConnection)
   Delete(Int)
-  Receive(String)
+  Receive(from: mist.WebsocketConnection, message: String)
 }
 
 pub fn main() {
@@ -100,6 +101,13 @@ fn decode_ws_message(text: String) -> Result(Message, List(dynamic.DecodeError))
   }
 }
 
+type WsMsgError {
+  IdNotFound(Int)
+  // Could use `glisten.SocketReason` to distinguish more about this error if needed.
+  WebsocketConnErr
+  MsgTypeNotFound(List(dynamic.DecodeError))
+}
+
 fn handle_message(
   msg: ConnectionMsg,
   state: State,
@@ -112,29 +120,39 @@ fn handle_message(
     Delete(id) ->
       dict.delete(state, id)
       |> actor.continue
-    Receive(text) -> {
+    Receive(origin_conn, text) -> {
       case decode_ws_message(text) {
         Ok(Chat(id, msg)) -> {
           // Send to ws if exists
-          let assert Ok(_) =
+          case
             dict.get(state, id)
+            |> result.map_error(fn(_) { IdNotFound(id) })
             |> result.then(fn(conn) {
               mist.send_text_frame(conn, msg)
-              |> result.nil_error
+              |> result.map_error(fn(_) { WebsocketConnErr })
             })
+          {
+            Error(IdNotFound(id)) -> {
+              mist.send_text_frame(
+                origin_conn,
+                "ID " <> int.to_string(id) <> " not found",
+              )
+              |> result.map_error(fn(_) { WebsocketConnErr })
+            }
+            _ -> Ok(Nil)
+          }
         }
         Ok(Broadcast(msg)) -> {
           // Send to all connected websockets
-          let assert Ok(_) =
-            dict.values(state)
-            |> list.try_each(fn(conn) {
-              mist.send_text_frame(conn, msg)
-              |> result.nil_error
-            })
+          dict.values(state)
+          |> list.try_each(fn(conn) {
+            mist.send_text_frame(conn, msg)
+            |> result.map_error(fn(_) { WebsocketConnErr })
+          })
         }
         Error(e) -> {
           io.debug(e)
-          Error(Nil)
+          Error(MsgTypeNotFound(e))
         }
       }
       actor.continue(state)
@@ -150,7 +168,7 @@ fn handle_ws_message(state, conn, message) {
     }
     mist.Text(text) -> {
       io.println("Received message: " <> text)
-      actor.send(state, Receive(text))
+      actor.send(state, Receive(conn, text))
       actor.continue(state)
     }
     mist.Binary(_) -> {
