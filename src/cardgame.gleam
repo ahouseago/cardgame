@@ -1,12 +1,15 @@
 import gleam/bytes_builder
 import gleam/dict.{type Dict}
+import gleam/dynamic
 import gleam/erlang/process
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/io
+import gleam/json
 import gleam/list
 import gleam/option.{Some}
 import gleam/otp/actor
+import gleam/result
 import mist.{type Connection, type ResponseData}
 
 type State =
@@ -55,6 +58,48 @@ fn on_init(state_subj, selector) {
   }
 }
 
+type Message {
+  Chat(Int, String)
+  Broadcast(String)
+}
+
+// {
+//   "type": "chat",
+//   "message": {
+//     "to": 2,
+//     "text": "abc"
+//   }
+// }
+
+fn decode_ws_message(text: String) -> Result(Message, List(dynamic.DecodeError)) {
+  let type_decoder =
+    dynamic.decode2(
+      fn(t, msg) { #(t, msg) },
+      dynamic.field("type", dynamic.string),
+      dynamic.field("message", dynamic.dynamic),
+    )
+  let msg_with_type = json.decode(text, type_decoder)
+  case msg_with_type {
+    Ok(#("chat", msg)) ->
+      msg
+      |> dynamic.decode2(
+        Chat,
+        dynamic.field("to", dynamic.int),
+        dynamic.field("text", dynamic.string),
+      )
+    Ok(#("broadcast", msg)) ->
+      msg
+      |> dynamic.decode1(Broadcast, dynamic.field("text", dynamic.string))
+    Ok(#(found, _)) ->
+      Error([dynamic.DecodeError("chat or broadcast", found, [])])
+    Error(json.UnexpectedFormat(e)) -> Error(e)
+    Error(json.UnexpectedByte(byte, _))
+    | Error(json.UnexpectedSequence(byte, _)) ->
+      Error([dynamic.DecodeError(byte, "", [])])
+    Error(_) -> Error([dynamic.DecodeError("chat or broadcast", "", [])])
+  }
+}
+
 fn handle_message(
   msg: ConnectionMsg,
   state: State,
@@ -68,10 +113,30 @@ fn handle_message(
       dict.delete(state, id)
       |> actor.continue
     Receive(text) -> {
-      // Send to all connected websockets
-      let assert Ok(_) =
-        dict.values(state)
-        |> list.try_each(fn(conn) { mist.send_text_frame(conn, text) })
+      case decode_ws_message(text) {
+        Ok(Chat(id, msg)) -> {
+          // Send to ws if exists
+          let assert Ok(_) =
+            dict.get(state, id)
+            |> result.then(fn(conn) {
+              mist.send_text_frame(conn, msg)
+              |> result.nil_error
+            })
+        }
+        Ok(Broadcast(msg)) -> {
+          // Send to all connected websockets
+          let assert Ok(_) =
+            dict.values(state)
+            |> list.try_each(fn(conn) {
+              mist.send_text_frame(conn, msg)
+              |> result.nil_error
+            })
+        }
+        Error(e) -> {
+          io.debug(e)
+          Error(Nil)
+        }
+      }
       actor.continue(state)
     }
   }
