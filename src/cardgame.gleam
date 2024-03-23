@@ -1,13 +1,12 @@
 import gleam/bytes_builder
 import gleam/dict.{type Dict}
 import gleam/dynamic
-import gleam/erlang/process
+import gleam/erlang/process.{type Subject}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/io
 import gleam/int
 import gleam/json
-import gleam/list
 import gleam/option.{Some}
 import gleam/otp/actor
 import gleam/pair
@@ -21,7 +20,13 @@ type Phase {
 }
 
 type Player {
-  Player(id: Int, conn: mist.WebsocketConnection, phase: Phase)
+  Player(id: Int, conn_subj: Subject(IndividualConnMessage), phase: Phase)
+}
+
+type IndividualConnMessage {
+  Publish(OutgoingMessage)
+  CreatedPlayer(Player)
+  Incoming(String)
 }
 
 type State {
@@ -29,9 +34,9 @@ type State {
 }
 
 type ConnectionMsg {
-  Create(mist.WebsocketConnection)
+  Create(process.Subject(IndividualConnMessage))
   Delete(Int)
-  Receive(from: mist.WebsocketConnection, message: String)
+  Receive(from: Int, message: String)
 }
 
 pub fn main() {
@@ -49,7 +54,7 @@ pub fn main() {
         ["ws"] ->
           mist.websocket(
             request: req,
-            on_init: on_init(state, selector),
+            on_init: on_init(state),
             on_close: fn(_state) { io.println("goodbye!") },
             handler: handle_ws_message,
           )
@@ -64,10 +69,38 @@ pub fn main() {
   process.sleep_forever()
 }
 
-fn on_init(state_subj, selector) {
+type ConnectionState {
+  Initialising(conn: mist.WebsocketConnection)
+  Created(player: Player, conn: mist.WebsocketConnection)
+}
+
+fn on_init(state_subj) {
   fn(conn) {
-    actor.send(state_subj, Create(conn))
-    #(state_subj, Some(selector))
+    let selector = process.new_selector()
+    let assert Ok(connection_subj) =
+      actor.start(Initialising(conn), fn(msg, connection_state) {
+        case msg {
+          CreatedPlayer(player) -> actor.continue(Created(player, conn))
+          Incoming(text) -> {
+            case connection_state {
+              Created(player, _) -> {
+                actor.send(state_subj, Receive(player.id, text))
+                actor.continue(connection_state)
+              }
+              _ -> actor.continue(connection_state)
+            }
+          }
+          Publish(outgoing_message) -> {
+            let assert Ok(_) =
+              mist.send_text_frame(conn, encode(outgoing_message))
+            actor.continue(connection_state)
+          }
+        }
+      })
+
+    actor.send(state_subj, Create(connection_subj))
+
+    #(connection_subj, Some(selector))
   }
 }
 
@@ -79,7 +112,7 @@ fn handle_ws_message(state, conn, message) {
     }
     mist.Text(text) -> {
       io.println("Received message: " <> text)
-      actor.send(state, Receive(conn, text))
+      actor.send(state, Incoming(text))
       actor.continue(state)
     }
     mist.Binary(_) | mist.Custom(_) -> {
@@ -94,16 +127,17 @@ fn handle_message(
   state: State,
 ) -> actor.Next(ConnectionMsg, State) {
   case msg {
-    Create(conn) -> {
+    Create(conn_subj) -> {
       let id = dict.size(state.players)
-      let new_state =
-        State(players: dict.insert(state.players, id, new_player(id, conn)))
+      let player = Player(id, conn_subj, Idle)
+      actor.send(conn_subj, CreatedPlayer(player))
+      let new_state = State(players: dict.insert(state.players, id, player))
       actor.continue(new_state)
     }
     Delete(id) ->
       State(players: dict.delete(state.players, id))
       |> actor.continue
-    Receive(origin_conn, text) -> {
+    Receive(origin_player_id, text) -> {
       case decode_ws_message(text) {
         Error(e) -> {
           io.debug(e)
@@ -115,12 +149,23 @@ fn handle_message(
             dict.get(state.players, id)
             |> result.map_error(fn(_) { IdNotFound(id) })
             |> result.then(fn(player) {
-              mist.send_text_frame(player.conn, msg)
-              |> result.map_error(fn(_) { WebsocketConnErr })
+              actor.send(
+                player.conn_subj,
+                Publish(Direct(origin_player_id, msg)),
+              )
+              Ok(Nil)
             })
           {
             Error(IdNotFound(id)) -> {
-              send_error(origin_conn, IdNotFound(id))
+              dict.get(state.players, origin_player_id)
+              |> result.then(fn(player) {
+                actor.send(
+                  player.conn_subj,
+                  Publish(Err(err_to_string(IdNotFound(id)))),
+                )
+                Ok(Nil)
+              })
+              |> result.map_error(fn(_) { IdNotFound(origin_player_id) })
             }
             _ -> Ok(Nil)
           }
@@ -128,15 +173,42 @@ fn handle_message(
         Ok(ChallengeRequest(id)) -> {
           case dict.get(state.players, id) {
             Ok(target_player) -> {
-              // don't think I have the origin player here to update their
-              // state to challenging
-              mist.send_text_frame(
-                target_player.conn,
-                "Challenged to a match by X, do you accept?",
+              // Player being challenged exists, so update the challenger to be
+              // challenging them in the state.
+              let state =
+                dict.get(state.players, origin_player_id)
+                |> result.then(fn(player) {
+                  let updated_player =
+                    Player(player.id, player.conn_subj, Challenging(id))
+                  Ok(
+                    State(players: dict.insert(
+                      state.players,
+                      origin_player_id,
+                      updated_player,
+                    )),
+                  )
+                })
+
+              // Send the challenge message to the target.
+              actor.send(
+                target_player.conn_subj,
+                Publish(Challenge(origin_player_id)),
               )
-              |> result.map_error(fn(_) { WebsocketConnErr })
+
+              actor.continue(state)
+              Ok(Nil)
             }
-            Error(_) -> send_error(origin_conn, IdNotFound(id))
+            Error(_) -> {
+              let _ = dict.get(state.players, origin_player_id)
+              |> result.then(fn(player) {
+                actor.send(
+                  player.conn_subj,
+                  Publish(Err(err_to_string(IdNotFound(id)))),
+                )
+                Ok(Nil)
+              })
+              Ok(Nil)
+            }
           }
         }
       }
@@ -145,16 +217,12 @@ fn handle_message(
   }
 }
 
-fn new_player(id, conn) -> Player {
-  Player(id, conn, Idle)
-}
-
 fn msg_to_json(msg) {
   case msg {
     Err(text) -> #("error", json.string(text))
-    Direct(to, text) -> #(
+    Direct(from, text) -> #(
       "chat",
-      json.object([#("to", json.int(to)), #("text", json.string(text))]),
+      json.object([#("from", json.int(from)), #("text", json.string(text))]),
     )
     Broadcast(text) -> #("broadcast", json.string(text))
     Challenge(from) -> #("challenge", json.object([#("from", json.int(from))]))
@@ -213,11 +281,11 @@ fn decode_ws_message(
         dynamic.field("to", dynamic.int),
         dynamic.field("text", dynamic.string),
       )
-    Ok(#("challengeRequest", msg)) ->
+    Ok(#("challenge", msg)) ->
       msg
       |> dynamic.decode1(ChallengeRequest, dynamic.field("target", dynamic.int))
     Ok(#(found, _)) ->
-      Error([dynamic.DecodeError("chat or broadcast", found, [])])
+      Error([dynamic.DecodeError("chat or challenge", found, [])])
     Error(json.UnexpectedFormat(e)) -> Error(e)
     Error(json.UnexpectedByte(byte, _))
     | Error(json.UnexpectedSequence(byte, _)) ->
@@ -228,16 +296,12 @@ fn decode_ws_message(
 
 type WsMsgError {
   IdNotFound(Int)
-  // Could use `glisten.SocketReason` to distinguish more about this error if needed.
-  WebsocketConnErr
   MsgTypeNotFound(List(dynamic.DecodeError))
 }
 
-fn send_error(conn, err) {
+fn err_to_string(err) {
   case err {
-    IdNotFound(id) ->
-      mist.send_text_frame(conn, "ID " <> int.to_string(id) <> " not found")
-    _ -> mist.send_text_frame(conn, "Unknown error occurred")
+    IdNotFound(id) -> "ID " <> int.to_string(id) <> " not found"
+    _ -> "Unknown error occurred"
   }
-  |> result.map_error(fn(_) { WebsocketConnErr })
 }
