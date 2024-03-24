@@ -155,140 +155,140 @@ fn handle_message(
       State(players: dict.delete(state.players, id))
       |> actor.continue
     Receive(origin_player_id, text) -> {
-      let origin_player = dict.get(state.players, origin_player_id)
+      handle_message_from_client(state, origin_player_id, text)
+    }
+  }
+}
 
-      case origin_player, decode_ws_message(text) {
-        Ok(origin_player), Error(e) -> {
-          io.debug(e)
+fn handle_message_from_client(state: State, origin_player_id: Int, text: String) {
+  let origin_player = dict.get(state.players, origin_player_id)
+
+  case origin_player, decode_ws_message(text) {
+    Ok(origin_player), Error(e) -> {
+      io.debug(e)
+      actor.send(
+        origin_player.conn_subj,
+        Publish(Err(err_to_string(MsgTypeNotFound(e)))),
+      )
+      actor.continue(state)
+    }
+    Ok(origin_player), Ok(Chat(id, msg)) -> {
+      // Send to ws if exists
+      case dict.get(state.players, id) {
+        Ok(player) ->
+          actor.send(player.conn_subj, Publish(Direct(origin_player_id, msg)))
+        Error(_) ->
           actor.send(
             origin_player.conn_subj,
-            Publish(Err(err_to_string(MsgTypeNotFound(e)))),
+            Publish(Err(err_to_string(IdNotFound(id)))),
           )
-          actor.continue(state)
+      }
+      actor.continue(state)
+    }
+    Ok(origin_player), Ok(ChallengeRequest(id)) -> {
+      case dict.get(state.players, id) {
+        Ok(target_player) -> {
+          // Player being challenged exists, so update the challenger to be
+          // challenging them in the state.
+          let new_state =
+            State(players: dict.insert(
+              state.players,
+              origin_player_id,
+              Player(..origin_player, phase: Challenging(id)),
+            ))
+
+          // Send the challenge message to the target.
+          actor.send(
+            target_player.conn_subj,
+            Publish(Challenge(origin_player_id)),
+          )
+
+          actor.continue(new_state)
         }
-        Ok(origin_player), Ok(Chat(id, msg)) -> {
-          // Send to ws if exists
-          case dict.get(state.players, id) {
-            Ok(player) ->
-              actor.send(
-                player.conn_subj,
-                Publish(Direct(origin_player_id, msg)),
-              )
-            Error(_) ->
-              actor.send(
-                origin_player.conn_subj,
-                Publish(Err(err_to_string(IdNotFound(id)))),
-              )
-          }
-          actor.continue(state)
-        }
-        Ok(origin_player), Ok(ChallengeRequest(id)) -> {
-          case dict.get(state.players, id) {
-            Ok(target_player) -> {
-              // Player being challenged exists, so update the challenger to be
-              // challenging them in the state.
-              let new_state =
-                State(players: dict.insert(
-                  state.players,
-                  origin_player_id,
-                  Player(..origin_player, phase: Challenging(id)),
-                ))
-
-              // Send the challenge message to the target.
-              actor.send(
-                target_player.conn_subj,
-                Publish(Challenge(origin_player_id)),
-              )
-
-              actor.continue(new_state)
-            }
-            Error(_) -> {
-              actor.send(
-                origin_player.conn_subj,
-                Publish(Err(err_to_string(IdNotFound(id)))),
-              )
-              actor.continue(state)
-            }
-          }
-        }
-        Ok(origin_player), Ok(ChallengeResponse(challenger_id, accepted)) -> {
-          let challenger =
-            dict.get(state.players, challenger_id)
-            |> result.replace_error(IdNotFound(challenger_id))
-            |> result.then(fn(challenger) {
-              case challenger.phase {
-                Challenging(target) if target == origin_player_id ->
-                  Ok(challenger)
-                _ -> {
-                  let err =
-                    InvalidRequest(
-                      "Could not accept challenge: player is not challenging you.",
-                    )
-                  actor.send(
-                    origin_player.conn_subj,
-                    Publish(Err(err_to_string(err))),
-                  )
-                  Error(err)
-                }
-              }
-            })
-          case challenger, accepted {
-            Ok(challenger), True -> {
-              let new_state =
-                State(
-                  players: dict.insert(
-                    state.players,
-                    challenger.id,
-                    Player(..challenger, phase: InMatch(origin_player_id)),
-                  )
-                  |> dict.insert(
-                    origin_player_id,
-                    Player(..origin_player, phase: InMatch(challenger.id)),
-                  ),
-                )
-              io.println(
-                "players now in a match: "
-                <> list.map([origin_player_id, challenger.id], int.to_string)
-                |> string.join(", "),
-              )
-
-              actor.send(challenger.conn_subj, Publish(ChallengeAccepted))
-
-              actor.continue(new_state)
-            }
-            Ok(challenger), False -> {
-              let new_state =
-                State(players: dict.insert(
-                  state.players,
-                  challenger.id,
-                  Player(..challenger, phase: Idle),
-                ))
-              io.println(
-                "challenge refused, [target, challenger] = "
-                <> list.map([origin_player_id, challenger.id], int.to_string)
-                |> string.join(", "),
-              )
-
-              actor.continue(new_state)
-            }
-            Error(ws_err), _ -> {
-              actor.send(
-                origin_player.conn_subj,
-                Publish(Err(err_to_string(ws_err))),
-              )
-              actor.continue(state)
-            }
-          }
-        }
-        Error(_), _ -> {
-          io.println(
-            "Recieved message from player with ID "
-            <> int.to_string(origin_player_id)
-            <> " not found in state.",
+        Error(_) -> {
+          actor.send(
+            origin_player.conn_subj,
+            Publish(Err(err_to_string(IdNotFound(id)))),
           )
           actor.continue(state)
         }
       }
+    }
+    Ok(origin_player), Ok(ChallengeResponse(challenger_id, accepted)) -> {
+      let challenger =
+        dict.get(state.players, challenger_id)
+        |> result.replace_error(IdNotFound(challenger_id))
+        |> result.then(fn(challenger) {
+          case challenger.phase {
+            Challenging(target) if target == origin_player_id -> Ok(challenger)
+            _ -> {
+              let err =
+                InvalidRequest(
+                  "Could not accept challenge: player is not challenging you.",
+                )
+              actor.send(
+                origin_player.conn_subj,
+                Publish(Err(err_to_string(err))),
+              )
+              Error(err)
+            }
+          }
+        })
+      case challenger, accepted {
+        Ok(challenger), True -> {
+          let new_state =
+            State(
+              players: dict.insert(
+                state.players,
+                challenger.id,
+                Player(..challenger, phase: InMatch(origin_player_id)),
+              )
+              |> dict.insert(
+                origin_player_id,
+                Player(..origin_player, phase: InMatch(challenger.id)),
+              ),
+            )
+          io.println(
+            "players now in a match: "
+            <> list.map([origin_player_id, challenger.id], int.to_string)
+            |> string.join(", "),
+          )
+
+          actor.send(challenger.conn_subj, Publish(ChallengeAccepted))
+
+          actor.continue(new_state)
+        }
+        Ok(challenger), False -> {
+          let new_state =
+            State(players: dict.insert(
+              state.players,
+              challenger.id,
+              Player(..challenger, phase: Idle),
+            ))
+          io.println(
+            "challenge refused, [target, challenger] = "
+            <> list.map([origin_player_id, challenger.id], int.to_string)
+            |> string.join(", "),
+          )
+
+          actor.continue(new_state)
+        }
+        Error(ws_err), _ -> {
+          actor.send(
+            origin_player.conn_subj,
+            Publish(Err(err_to_string(ws_err))),
+          )
+          actor.continue(state)
+        }
+      }
+    }
+    Error(_), _ -> {
+      io.println(
+        "Recieved message from player with ID "
+        <> int.to_string(origin_player_id)
+        <> " not found in state.",
+      )
+      actor.continue(state)
     }
   }
 }
