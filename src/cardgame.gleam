@@ -49,6 +49,7 @@ type IncomingMessage {
 
 type OutgoingMessage {
   Err(String)
+  PhaseUpdate(Phase)
   Direct(from: Int, String)
   Broadcast(String)
   Challenge(from: Int)
@@ -186,32 +187,53 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
       actor.continue(state)
     }
     Ok(origin_player), Ok(ChallengeRequest(id)) -> {
-      case dict.get(state.players, id) {
-        Ok(target_player) -> {
-          // Player being challenged exists, so update the challenger to be
-          // challenging them in the state.
-          let new_state =
-            State(players: dict.insert(
-              state.players,
-              origin_player_id,
-              Player(..origin_player, phase: Challenging(id)),
-            ))
-
-          // Send the challenge message to the target.
-          actor.send(
-            target_player.conn_subj,
-            Publish(Challenge(origin_player_id)),
-          )
-
-          actor.continue(new_state)
-        }
-        Error(_) -> {
+      case origin_player.phase {
+        InMatch(_) | Challenging(_) -> {
           actor.send(
             origin_player.conn_subj,
-            Publish(Err(err_to_string(IdNotFound(id)))),
+            Publish(
+              Err(
+                err_to_string(InvalidRequest(
+                  "Cannot challenge while already challenging a player",
+                )),
+              ),
+            ),
           )
           actor.continue(state)
         }
+        Idle ->
+          case dict.get(state.players, id) {
+            Ok(target_player) -> {
+              // Player being challenged exists, so update the challenger to be
+              // challenging them in the state.
+              let next_phase = Challenging(id)
+              let new_state =
+                State(players: dict.insert(
+                  state.players,
+                  origin_player_id,
+                  Player(..origin_player, phase: next_phase),
+                ))
+              actor.send(
+                origin_player.conn_subj,
+                Publish(PhaseUpdate(next_phase)),
+              )
+
+              // Send the challenge message to the target.
+              actor.send(
+                target_player.conn_subj,
+                Publish(Challenge(origin_player_id)),
+              )
+
+              actor.continue(new_state)
+            }
+            Error(_) -> {
+              actor.send(
+                origin_player.conn_subj,
+                Publish(Err(err_to_string(IdNotFound(id)))),
+              )
+              actor.continue(state)
+            }
+          }
       }
     }
     Ok(origin_player), Ok(ChallengeResponse(challenger_id, accepted)) -> {
@@ -224,7 +246,7 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
             _ -> {
               let err =
                 InvalidRequest(
-                  "Could not accept challenge: player is not challenging you.",
+                  "Could not respond to challenge: player is not challenging you.",
                 )
               actor.send(
                 origin_player.conn_subj,
@@ -255,6 +277,14 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
           )
 
           actor.send(challenger.conn_subj, Publish(ChallengeAccepted))
+          actor.send(
+            origin_player.conn_subj,
+            Publish(PhaseUpdate(InMatch(challenger.id))),
+          )
+          actor.send(
+            challenger.conn_subj,
+            Publish(PhaseUpdate(InMatch(origin_player.id))),
+          )
 
           actor.continue(new_state)
         }
@@ -265,6 +295,7 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
               challenger.id,
               Player(..challenger, phase: Idle),
             ))
+          actor.send(challenger.conn_subj, Publish(PhaseUpdate(Idle)))
           io.println(
             "challenge refused, [target, challenger] = "
             <> list.map([origin_player_id, challenger.id], int.to_string)
@@ -303,6 +334,21 @@ fn msg_to_json(msg) {
     Broadcast(text) -> #("broadcast", json.string(text))
     Challenge(from) -> #("challenge", json.object([#("from", json.int(from))]))
     ChallengeAccepted -> #("challengeAccepted", json.null())
+    PhaseUpdate(phase) -> #(
+      "status",
+      json.object([
+        #(
+          "phase",
+          case phase {
+              Idle -> "idle"
+              Challenging(id) ->
+                "waiting for challenge response from " <> int.to_string(id)
+              InMatch(id) -> "in a match with " <> int.to_string(id)
+            }
+            |> json.string,
+        ),
+      ]),
+    )
   }
   // ChallengeResponse(target, accepted) -> #(
   //   "challengeResponse",
