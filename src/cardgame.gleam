@@ -8,7 +8,7 @@ import gleam/int
 import gleam/io
 import gleam/json
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/pair
 import gleam/result
@@ -32,7 +32,7 @@ type IndividualConnMessage {
 }
 
 type State {
-  State(players: Dict(Int, Player))
+  State(players: Dict(Int, Player), matches: Dict(Int, MatchState))
 }
 
 type ConnectionMsg {
@@ -41,10 +41,38 @@ type ConnectionMsg {
   Receive(from: Int, message: String)
 }
 
+type Card {
+  Attack
+  Counter
+  Rest
+}
+
+type Hand {
+  Hand(attacks: Int, counters: Int, rests: Int)
+}
+
+type PlayerMatchState {
+  PlayerMatchState(
+    cards_remaining: Hand,
+    chosen_card: option.Option(Card),
+    health: Int,
+  )
+}
+
+fn initial_match_state() {
+  PlayerMatchState(cards_remaining: Hand(2, 1, 1), chosen_card: None, health: 5)
+}
+
+type MatchState {
+  ResolvingRound(List(#(Int, PlayerMatchState)))
+  Finished(winner: Int, loser: Int)
+}
+
 type IncomingMessage {
   Chat(to: Int, String)
   ChallengeRequest(target: Int)
   ChallengeResponse(challenger: Int, accepted: Bool)
+  PlayCard(Card)
 }
 
 type OutgoingMessage {
@@ -54,13 +82,14 @@ type OutgoingMessage {
   Broadcast(String)
   Challenge(from: Int)
   ChallengeAccepted
+  CardsRemaining(Hand)
 }
 
 pub fn main() {
   // These values are for the Websocket process initialized below
   // let selector = process.new_selector()
   let assert Ok(state_subject) =
-    actor.start(State(players: dict.new()), handle_message)
+    actor.start(State(players: dict.new(), matches: dict.new()), handle_message)
 
   let not_found =
     response.new(404)
@@ -149,23 +178,33 @@ fn handle_message(
       let id = dict.size(state.players)
       let player = Player(id, conn_subj, Idle)
       actor.send(conn_subj, CreatedPlayer(player))
-      let new_state = State(players: dict.insert(state.players, id, player))
+      let new_state =
+        State(..state, players: dict.insert(state.players, id, player))
       actor.continue(new_state)
     }
     Delete(id) ->
-      State(players: dict.delete(state.players, id))
+      State(..state, players: dict.delete(state.players, id))
       |> actor.continue
     Receive(origin_player_id, text) -> {
-      handle_message_from_client(state, origin_player_id, text)
+      case dict.get(state.players, origin_player_id) {
+        Ok(origin_player) ->
+          handle_message_from_client(state, origin_player, text)
+        Error(_) -> {
+          io.println(
+            "Recieved message from player with ID "
+            <> int.to_string(origin_player_id)
+            <> " not found in state.",
+          )
+          actor.continue(state)
+        }
+      }
     }
   }
 }
 
-fn handle_message_from_client(state: State, origin_player_id: Int, text: String) {
-  let origin_player = dict.get(state.players, origin_player_id)
-
-  case origin_player, decode_ws_message(text) {
-    Ok(origin_player), Error(e) -> {
+fn handle_message_from_client(state: State, origin_player: Player, text: String) {
+  case decode_ws_message(text) {
+    Error(e) -> {
       io.debug(e)
       actor.send(
         origin_player.conn_subj,
@@ -173,11 +212,11 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
       )
       actor.continue(state)
     }
-    Ok(origin_player), Ok(Chat(id, msg)) -> {
+    Ok(Chat(id, msg)) -> {
       // Send to ws if exists
       case dict.get(state.players, id) {
         Ok(player) ->
-          actor.send(player.conn_subj, Publish(Direct(origin_player_id, msg)))
+          actor.send(player.conn_subj, Publish(Direct(origin_player.id, msg)))
         Error(_) ->
           actor.send(
             origin_player.conn_subj,
@@ -186,7 +225,7 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
       }
       actor.continue(state)
     }
-    Ok(origin_player), Ok(ChallengeRequest(id)) -> {
+    Ok(ChallengeRequest(id)) -> {
       case origin_player.phase {
         InMatch(_) | Challenging(_) -> {
           actor.send(
@@ -208,11 +247,14 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
               // challenging them in the state.
               let next_phase = Challenging(id)
               let new_state =
-                State(players: dict.insert(
-                  state.players,
-                  origin_player_id,
-                  Player(..origin_player, phase: next_phase),
-                ))
+                State(
+                  ..state,
+                  players: dict.insert(
+                    state.players,
+                    origin_player.id,
+                    Player(..origin_player, phase: next_phase),
+                  ),
+                )
               actor.send(
                 origin_player.conn_subj,
                 Publish(PhaseUpdate(next_phase)),
@@ -221,7 +263,7 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
               // Send the challenge message to the target.
               actor.send(
                 target_player.conn_subj,
-                Publish(Challenge(origin_player_id)),
+                Publish(Challenge(origin_player.id)),
               )
 
               actor.continue(new_state)
@@ -236,13 +278,13 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
           }
       }
     }
-    Ok(origin_player), Ok(ChallengeResponse(challenger_id, accepted)) -> {
+    Ok(ChallengeResponse(challenger_id, accepted)) -> {
       let challenger =
         dict.get(state.players, challenger_id)
         |> result.replace_error(IdNotFound(challenger_id))
         |> result.then(fn(challenger) {
           case challenger.phase {
-            Challenging(target) if target == origin_player_id -> Ok(challenger)
+            Challenging(target) if target == origin_player.id -> Ok(challenger)
             _ -> {
               let err =
                 InvalidRequest(
@@ -258,21 +300,32 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
         })
       case challenger, accepted {
         Ok(challenger), True -> {
+          let match_id = dict.size(state.matches)
           let new_state =
             State(
               players: dict.insert(
-                state.players,
-                challenger.id,
-                Player(..challenger, phase: InMatch(origin_player_id)),
-              )
-              |> dict.insert(
-                origin_player_id,
-                Player(..origin_player, phase: InMatch(challenger.id)),
+                  state.players,
+                  challenger.id,
+                  Player(..challenger, phase: InMatch(match_id)),
+                )
+                |> dict.insert(
+                  origin_player.id,
+                  Player(..origin_player, phase: InMatch(match_id)),
+                ),
+              matches: dict.insert(
+                state.matches,
+                match_id,
+                ResolvingRound([
+                  #(origin_player.id, initial_match_state()),
+                  #(challenger.id, initial_match_state()),
+                ]),
               ),
             )
           io.println(
-            "players now in a match: "
-            <> list.map([origin_player_id, challenger.id], int.to_string)
+            "match started: "
+            <> int.to_string(match_id)
+            <> "players: "
+            <> list.map([origin_player.id, challenger.id], int.to_string)
             |> string.join(", "),
           )
 
@@ -290,15 +343,18 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
         }
         Ok(challenger), False -> {
           let new_state =
-            State(players: dict.insert(
-              state.players,
-              challenger.id,
-              Player(..challenger, phase: Idle),
-            ))
+            State(
+              ..state,
+              players: dict.insert(
+                state.players,
+                challenger.id,
+                Player(..challenger, phase: Idle),
+              ),
+            )
           actor.send(challenger.conn_subj, Publish(PhaseUpdate(Idle)))
           io.println(
             "challenge refused, [target, challenger] = "
-            <> list.map([origin_player_id, challenger.id], int.to_string)
+            <> list.map([origin_player.id, challenger.id], int.to_string)
             |> string.join(", "),
           )
 
@@ -313,14 +369,164 @@ fn handle_message_from_client(state: State, origin_player_id: Int, text: String)
         }
       }
     }
-    Error(_), _ -> {
-      io.println(
-        "Recieved message from player with ID "
-        <> int.to_string(origin_player_id)
-        <> " not found in state.",
-      )
-      actor.continue(state)
+    Ok(PlayCard(card)) -> {
+      let match_state = case origin_player.phase {
+        InMatch(match_id) -> {
+          let match_state = dict.get(state.matches, match_id)
+          case match_state {
+            Ok(Finished(_, _)) -> Error(InvalidRequest("match has concluded"))
+            Ok(ResolvingRound([
+                #(player1_id, player1_state),
+                #(player2_id, player2_state),
+              ])) if player1_id == origin_player.id ->
+              handle_play_card(
+                match_id,
+                player1_id,
+                player1_state,
+                card,
+                player2_id,
+                player2_state,
+              )
+            Ok(ResolvingRound([
+                #(player2_id, player2_state),
+                #(player1_id, player1_state),
+              ])) if player1_id == origin_player.id ->
+              handle_play_card(
+                match_id,
+                player1_id,
+                player1_state,
+                card,
+                player2_id,
+                player2_state,
+              )
+            Ok(ResolvingRound(_)) -> Error(InvalidRequest("bad match state"))
+            Error(_) -> Error(InvalidRequest("match not found"))
+          }
+        }
+        _ -> Error(InvalidRequest("cannot play card: not in match"))
+      }
+      case match_state {
+        Ok(match_state) -> {
+          let #(match_id, new_match_state) = match_state
+          actor.continue(
+            State(
+              ..state,
+              matches: dict.insert(state.matches, match_id, new_match_state),
+            ),
+          )
+        }
+        Error(ws_err) -> {
+          actor.send(
+            origin_player.conn_subj,
+            Publish(Err(err_to_string(ws_err))),
+          )
+          actor.continue(state)
+        }
+      }
     }
+  }
+}
+
+fn handle_play_card(
+  match_id: Int,
+  player1_id: Int,
+  player1_state: PlayerMatchState,
+  player1_card: Card,
+  player2_id: Int,
+  player2_state: PlayerMatchState,
+) -> Result(#(Int, MatchState), WsMsgError) {
+  let current_chosen_card = player1_state.chosen_card
+  let player1_state = case current_chosen_card {
+    None -> player1_state
+    Some(Attack) ->
+      PlayerMatchState(
+        ..player1_state,
+        chosen_card: None,
+        cards_remaining: Hand(
+          ..player1_state.cards_remaining,
+          attacks: { player1_state.cards_remaining.attacks + 1 },
+        ),
+      )
+    Some(Counter) ->
+      PlayerMatchState(
+        ..player1_state,
+        chosen_card: None,
+        cards_remaining: Hand(
+          ..player1_state.cards_remaining,
+          counters: { player1_state.cards_remaining.counters + 1 },
+        ),
+      )
+    Some(Rest) ->
+      PlayerMatchState(
+        ..player1_state,
+        chosen_card: None,
+        cards_remaining: Hand(
+          ..player1_state.cards_remaining,
+          rests: { player1_state.cards_remaining.rests + 1 },
+        ),
+      )
+  }
+  // Check they have this card in their hand and update their hand to remove
+  // the card
+  let player1_state = case player1_card {
+    Attack -> {
+      let attacks = player1_state.cards_remaining.attacks
+      case attacks > 0 {
+        True ->
+          PlayerMatchState(
+            ..player1_state,
+            chosen_card: Some(Attack),
+            cards_remaining: Hand(
+              ..player1_state.cards_remaining,
+              attacks: { attacks - 1 },
+            ),
+          )
+        False -> player1_state
+      }
+    }
+    Counter -> {
+      let counters = player1_state.cards_remaining.counters
+      case counters > 0 {
+        True -> {
+          PlayerMatchState(
+            ..player1_state,
+            chosen_card: Some(Counter),
+            cards_remaining: Hand(
+              ..player1_state.cards_remaining,
+              counters: { counters - 1 },
+            ),
+          )
+        }
+        False -> player1_state
+      }
+    }
+    Rest -> {
+      let rests = player1_state.cards_remaining.rests
+      case rests > 0 {
+        True ->
+          PlayerMatchState(
+            ..player1_state,
+            chosen_card: Some(Rest),
+            cards_remaining: Hand(
+              ..player1_state.cards_remaining,
+              rests: { rests - 1 },
+            ),
+          )
+        False -> player1_state
+      }
+    }
+  }
+  case player1_state.chosen_card, player2_state.chosen_card {
+    Some(player1_card), Some(player2_card) -> todo as "resolve the round"
+    None, _ -> Error(InvalidRequest("do not have card in hand"))
+    Some(_), None ->
+      Ok(#(
+        match_id,
+        ResolvingRound([
+          #(player1_id, player1_state),
+          #(player2_id, player2_state),
+        ]),
+      ))
   }
 }
 
@@ -347,6 +553,14 @@ fn msg_to_json(msg) {
             }
             |> json.string,
         ),
+      ]),
+    )
+    CardsRemaining(hand) -> #(
+      "cards",
+      json.object([
+        #("attacks", json.int(hand.attacks)),
+        #("counters", json.int(hand.counters)),
+        #("rests", json.int(hand.rests)),
       ]),
     )
   }
@@ -401,8 +615,35 @@ fn decode_ws_message(
         dynamic.field("challenger", dynamic.int),
         dynamic.field("accepted", dynamic.bool),
       )
+    Ok(#("playCard", msg)) ->
+      msg
+      |> dynamic.decode1(
+        PlayCard,
+        dynamic.field("card", fn(card) {
+          dynamic.string(card)
+          |> result.then(fn(card_str) {
+            case card_str {
+              "attack" -> Ok(Attack)
+              "counter" -> Ok(Counter)
+              "rest" -> Ok(Rest)
+              other ->
+                Error([
+                  dynamic.DecodeError("attack | counter | rest", other, [
+                    "message", "card",
+                  ]),
+                ])
+            }
+          })
+        }),
+      )
     Ok(#(found, _)) ->
-      Error([dynamic.DecodeError("chat or challenge", found, [])])
+      Error([
+        dynamic.DecodeError(
+          "chat | challenge | challengeResponse | playCard",
+          found,
+          [],
+        ),
+      ])
     Error(json.UnexpectedFormat(e)) -> Error(e)
     Error(json.UnexpectedByte(byte, _))
     | Error(json.UnexpectedSequence(byte, _)) ->
