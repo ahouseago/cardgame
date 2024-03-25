@@ -445,12 +445,25 @@ fn handle_message_from_client(state: State, origin_player: Player, text: String)
             _ -> Error(Nil)
           }
 
-          actor.continue(
-            State(
-              ..state,
-              matches: dict.insert(state.matches, match_id, new_match_state),
-            ),
-          )
+          let players = case new_match_state {
+            Finished(PlayerIdPair(id1, id2), _) -> {
+              let player1 = dict.get(state.players, id1)
+              let player2 = dict.get(state.players, id2)
+              case player1, player2 {
+                Ok(player1), Ok(player2) ->
+                  state.players
+                  |> dict.insert(id1, Player(..player1, phase: Idle))
+                  |> dict.insert(id2, Player(..player2, phase: Idle))
+                _, _ -> state.players
+              }
+            }
+            _ -> state.players
+          }
+
+          actor.continue(State(
+            players: players,
+            matches: dict.insert(state.matches, match_id, new_match_state),
+          ))
         }
         Error(ws_err) -> {
           actor.send(
