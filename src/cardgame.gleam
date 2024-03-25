@@ -63,9 +63,14 @@ fn initial_match_state() {
   PlayerMatchState(cards_remaining: Hand(2, 1, 1), chosen_card: None, health: 5)
 }
 
+type EndState {
+  Draw
+  Victory(winner: Int)
+}
+
 type MatchState {
   ResolvingRound(List(#(Int, PlayerMatchState)))
-  Finished(winner: Int, loser: Int)
+  Finished(EndState)
 }
 
 type IncomingMessage {
@@ -374,7 +379,7 @@ fn handle_message_from_client(state: State, origin_player: Player, text: String)
         InMatch(match_id) -> {
           let match_state = dict.get(state.matches, match_id)
           case match_state {
-            Ok(Finished(_, _)) -> Error(InvalidRequest("match has concluded"))
+            Ok(Finished(_)) -> Error(InvalidRequest("match has concluded"))
             Ok(ResolvingRound([
                 #(player1_id, player1_state),
                 #(player2_id, player2_state),
@@ -517,7 +522,34 @@ fn handle_play_card(
     }
   }
   case player1_state.chosen_card, player2_state.chosen_card {
-    Some(player1_card), Some(player2_card) -> todo as "resolve the round"
+    Some(player1_card), Some(player2_card) -> {
+      let card_rewards_player1 = get_card_rewards(player1_card, player2_card)
+      let card_rewards_player2 = get_card_rewards(player2_card, player1_card)
+      // for now just add all the new cards, need to add an intermediate state
+      // where the players are choosing their reward later to limit it to 1
+      // each round.
+      let player1_state =
+        apply_hp_diff(player1_state, get_hp_diff(player1_card, player2_card))
+        |> list.fold(card_rewards_player1, _, add_card_to_hand)
+
+      let player2_state =
+        apply_hp_diff(player2_state, get_hp_diff(player2_card, player1_card))
+        |> list.fold(card_rewards_player2, _, add_card_to_hand)
+
+      case player1_state.health, player2_state.health {
+        0, 0 -> Ok(#(match_id, Finished(Draw)))
+        0, _ -> Ok(#(match_id, Finished(Victory(player2_id))))
+        _, 0 -> Ok(#(match_id, Finished(Victory(player1_id))))
+        _, _ ->
+          Ok(#(
+            match_id,
+            ResolvingRound([
+              #(player1_id, player1_state),
+              #(player2_id, player2_state),
+            ]),
+          ))
+      }
+    }
     None, _ -> Error(InvalidRequest("do not have card in hand"))
     Some(_), None ->
       Ok(#(
@@ -527,6 +559,91 @@ fn handle_play_card(
           #(player2_id, player2_state),
         ]),
       ))
+  }
+}
+
+fn add_card_to_hand(state, card) {
+  case card {
+    Attack ->
+      PlayerMatchState(
+        ..state,
+        cards_remaining: Hand(
+          ..state.cards_remaining,
+          attacks: { state.cards_remaining.attacks + 1 },
+        ),
+      )
+    Counter ->
+      PlayerMatchState(
+        ..state,
+        cards_remaining: Hand(
+          ..state.cards_remaining,
+          attacks: { state.cards_remaining.counters + 1 },
+        ),
+      )
+    Rest ->
+      PlayerMatchState(
+        ..state,
+        cards_remaining: Hand(
+          ..state.cards_remaining,
+          attacks: { state.cards_remaining.rests + 1 },
+        ),
+      )
+  }
+}
+
+// fn resolve_round(
+//   player1_state: PlayerMatchState,
+//   player1_card: Card,
+//   player2_state: PlayerMatchState,
+//   player2_card: Card,
+// ) {
+//   let card_rewards_player1 = get_card_rewards(player1_card, player2_card)
+//   let card_rewards_player2 = get_card_rewards(player2_card, player1_card)
+//   let player1_state =
+//     apply_hp_diff(player1_state, get_hp_diff(player1_card, player2_card))
+//   let player2_state =
+//     apply_hp_diff(player2_state, get_hp_diff(player2_card, player1_card))
+//
+//   #(#(card_rewards_player1, player1_state), #(
+//     card_rewards_player2,
+//     player2_state,
+//   ))
+// }
+
+fn get_hp_diff(player_card, opponent_card) {
+  // Could "simplify" this into two cases: one that returns -1 and one that
+  // returns 0 but this is probably more readable and easier to tweak later.
+  case player_card, opponent_card {
+    Attack, Attack -> -1
+    Attack, Counter -> -1
+    Attack, Rest -> 0
+    Counter, Attack -> 0
+    Counter, Counter -> 0
+    Counter, Rest -> 0
+    Rest, Attack -> -1
+    Rest, Counter -> 0
+    Rest, Rest -> 0
+  }
+}
+
+fn apply_hp_diff(state, diff) {
+  PlayerMatchState(..state, health: state.health + diff)
+}
+
+/// Returns a list of card rewards to choose from. If the length of the list is
+/// less than 2 then there is no choice and you would automatically get the
+/// card.
+fn get_card_rewards(player_card, opponent_card) {
+  case player_card, opponent_card {
+    Attack, Attack -> []
+    Attack, Counter -> []
+    Attack, Rest -> []
+    Counter, Attack -> [Counter]
+    Counter, Counter -> []
+    Counter, Rest -> []
+    Rest, Attack -> [Attack]
+    Rest, Counter -> [Attack, Counter]
+    Rest, Rest -> [Attack, Counter]
   }
 }
 
