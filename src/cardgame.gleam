@@ -52,15 +52,28 @@ type Hand {
 }
 
 type PlayerMatchState {
-  PlayerMatchState(hand: Hand, chosen_card: option.Option(Card), health: Int)
+  PlayerMatchState(
+    // Player ID
+    id: Int,
+    hand: Hand,
+    chosen_card: Option(Card),
+    health: Int,
+    unresolved_card_choice: Option(List(Card)),
+  )
 }
 
 type OpponentMatchState {
   OpponentMatchState(num_cards: Int, health: Int)
 }
 
-fn initial_match_state() {
-  PlayerMatchState(hand: Hand(2, 1, 1), chosen_card: None, health: 5)
+fn initial_match_state(id) {
+  PlayerMatchState(
+    id,
+    hand: Hand(2, 1, 1),
+    chosen_card: None,
+    health: 5,
+    unresolved_card_choice: None,
+  )
 }
 
 type EndState {
@@ -73,13 +86,12 @@ type PlayerIdPair {
 }
 
 type MatchState {
-  ResolvingRound(PlayerIdPair, List(#(Int, PlayerMatchState)))
+  ResolvingRound(PlayerIdPair, List(PlayerMatchState))
   Finished(PlayerIdPair, EndState)
 }
 
 type RoundResult {
   MatchEnded(EndState)
-  ChooseCard(List(Card))
   NextRound(you: PlayerMatchState, opponent: OpponentMatchState)
 }
 
@@ -88,6 +100,7 @@ type IncomingMessage {
   ChallengeRequest(target: Int)
   ChallengeResponse(challenger: Int, accepted: Bool)
   PlayCard(Card)
+  PickCard(Card)
 }
 
 type OutgoingMessage {
@@ -331,8 +344,8 @@ fn handle_message_from_client(state: State, origin_player: Player, text: String)
                 state.matches,
                 match_id,
                 ResolvingRound(PlayerIdPair(origin_player.id, challenger.id), [
-                  #(origin_player.id, initial_match_state()),
-                  #(challenger.id, initial_match_state()),
+                  initial_match_state(origin_player.id),
+                  initial_match_state(challenger.id),
                 ]),
               ),
             )
@@ -390,30 +403,83 @@ fn handle_message_from_client(state: State, origin_player: Player, text: String)
           let match_state = dict.get(state.matches, match_id)
           case match_state {
             Ok(Finished(_, _)) -> Error(InvalidRequest("match has concluded"))
-            Ok(ResolvingRound(
-                _,
-                [#(player1_id, player1_state), #(player2_id, player2_state)],
-              )) if player1_id == origin_player.id ->
-              handle_play_card(
-                match_id,
-                player1_id,
-                player1_state,
-                card,
-                player2_id,
-                player2_state,
+            Ok(ResolvingRound(_, [player1, player2]))
+              | Ok(ResolvingRound(_, [player2, player1])) if player1.id
+              == origin_player.id ->
+              check_no_unresolved_choices(
+                player1,
+                handle_play_card(match_id, player1, card, player2),
               )
-            Ok(ResolvingRound(
-                _,
-                [#(player2_id, player2_state), #(player1_id, player1_state)],
-              )) if player1_id == origin_player.id ->
-              handle_play_card(
-                match_id,
-                player1_id,
-                player1_state,
-                card,
-                player2_id,
-                player2_state,
-              )
+            Ok(ResolvingRound(_, _)) -> Error(InvalidRequest("bad match state"))
+            Error(_) -> Error(InvalidRequest("match not found"))
+          }
+        }
+        _ -> Error(InvalidRequest("cannot play card: not in match"))
+      }
+      case match_state {
+        Ok(match_state) -> {
+          let #(match_id, new_match_state) = match_state
+
+          case get_round_results(new_match_state) {
+            [#(id1, result1), #(id2, result2)] -> {
+              let _ =
+                state.players
+                |> dict.get(id1)
+                |> result.then(fn(player) {
+                  actor.send(player.conn_subj, Publish(RoundResult(result1)))
+                  Ok(Nil)
+                })
+              let _ =
+                state.players
+                |> dict.get(id2)
+                |> result.then(fn(player) {
+                  actor.send(player.conn_subj, Publish(RoundResult(result2)))
+                  Ok(Nil)
+                })
+              Ok(Nil)
+            }
+            _ -> Error(Nil)
+          }
+
+          let players = case new_match_state {
+            Finished(PlayerIdPair(id1, id2), _) -> {
+              let player1 = dict.get(state.players, id1)
+              let player2 = dict.get(state.players, id2)
+              case player1, player2 {
+                Ok(player1), Ok(player2) ->
+                  state.players
+                  |> dict.insert(id1, Player(..player1, phase: Idle))
+                  |> dict.insert(id2, Player(..player2, phase: Idle))
+                _, _ -> state.players
+              }
+            }
+            _ -> state.players
+          }
+
+          actor.continue(State(
+            players: players,
+            matches: dict.insert(state.matches, match_id, new_match_state),
+          ))
+        }
+        Error(ws_err) -> {
+          actor.send(
+            origin_player.conn_subj,
+            Publish(Err(err_to_string(ws_err))),
+          )
+          actor.continue(state)
+        }
+      }
+    }
+    Ok(PickCard(choice)) -> {
+      let match_state = case origin_player.phase {
+        InMatch(match_id) -> {
+          let match_state = dict.get(state.matches, match_id)
+          case match_state {
+            Ok(Finished(_, _)) -> Error(InvalidRequest("match has concluded"))
+            Ok(ResolvingRound(_, [player, opponent]))
+              | Ok(ResolvingRound(_, [opponent, player])) if player.id
+              == origin_player.id ->
+              handle_pick_card(match_id, player, choice, opponent)
             Ok(ResolvingRound(_, _)) -> Error(InvalidRequest("bad match state"))
             Error(_) -> Error(InvalidRequest("match not found"))
           }
@@ -483,20 +549,17 @@ fn get_round_results(match_state: MatchState) {
       #(id1, MatchEnded(end_state)),
       #(id2, MatchEnded(end_state)),
     ]
-    ResolvingRound(
-      PlayerIdPair(_, _),
-      [#(id, player_state), #(opponent_id, opponent_state)],
-    ) -> {
+    ResolvingRound(PlayerIdPair(_, _), [player_state, opponent_state]) -> {
       [
         #(
-          id,
+          player_state.id,
           NextRound(
             you: player_state,
             opponent: to_opponent_state(opponent_state),
           ),
         ),
         #(
-          opponent_id,
+          opponent_state.id,
           NextRound(
             you: opponent_state,
             opponent: to_opponent_state(player_state),
@@ -516,124 +579,153 @@ fn to_opponent_state(state: PlayerMatchState) -> OpponentMatchState {
   OpponentMatchState(num_cards: num_cards, health: state.health)
 }
 
+// check_no_unresolved_choices returns an error if the provided state has
+// unresolved card choices.
+fn check_no_unresolved_choices(player_state: PlayerMatchState, ok_state) {
+  case player_state.unresolved_card_choice {
+    None | Some([]) -> ok_state
+    Some([_, ..]) ->
+      Error(InvalidRequest("must pick card reward before playing next card"))
+  }
+}
+
+fn handle_pick_card(
+  match_id: Int,
+  player_state: PlayerMatchState,
+  choice: Card,
+  opponent_state: PlayerMatchState,
+) {
+  case player_state.unresolved_card_choice {
+    None | Some([]) -> Error(InvalidRequest("no card choices to pick"))
+    Some(available_choices) -> {
+      case list.contains(available_choices, choice) {
+        False ->
+          Error(InvalidRequest(
+            card_to_string(choice) <> " is not available to choose",
+          ))
+        True -> {
+          let player_state =
+            PlayerMatchState(..player_state, unresolved_card_choice: None)
+            |> add_card_to_hand(choice)
+
+          Ok(#(
+            match_id,
+            ResolvingRound(PlayerIdPair(player_state.id, opponent_state.id), [
+              player_state,
+              opponent_state,
+            ]),
+          ))
+        }
+      }
+    }
+  }
+}
+
 fn handle_play_card(
   match_id: Int,
-  player1_id: Int,
-  player1_state: PlayerMatchState,
+  player1: PlayerMatchState,
   player1_card: Card,
-  player2_id: Int,
-  player2_state: PlayerMatchState,
+  player2: PlayerMatchState,
 ) -> Result(#(Int, MatchState), WsMsgError) {
-  let current_chosen_card = player1_state.chosen_card
+  let current_chosen_card = player1.chosen_card
 
   // Return their last played card to their hand if they had one.
-  let player1_state = case current_chosen_card {
-    None -> player1_state
+  let player1 = case current_chosen_card {
+    None -> player1
     Some(Attack) ->
       PlayerMatchState(
-        ..player1_state,
+        ..player1,
         chosen_card: None,
-        hand: Hand(
-          ..player1_state.hand,
-          attacks: { player1_state.hand.attacks + 1 },
-        ),
+        hand: Hand(..player1.hand, attacks: { player1.hand.attacks + 1 }),
       )
     Some(Counter) ->
       PlayerMatchState(
-        ..player1_state,
+        ..player1,
         chosen_card: None,
-        hand: Hand(
-          ..player1_state.hand,
-          counters: { player1_state.hand.counters + 1 },
-        ),
+        hand: Hand(..player1.hand, counters: { player1.hand.counters + 1 }),
       )
     Some(Rest) ->
       PlayerMatchState(
-        ..player1_state,
+        ..player1,
         chosen_card: None,
-        hand: Hand(
-          ..player1_state.hand,
-          rests: { player1_state.hand.rests + 1 },
-        ),
+        hand: Hand(..player1.hand, rests: { player1.hand.rests + 1 }),
       )
   }
   // Check they have this card in their hand and update their hand to remove
   // the card
-  let player1_state = case player1_card {
+  let player1 = case player1_card {
     Attack -> {
-      let attacks = player1_state.hand.attacks
+      let attacks = player1.hand.attacks
       case attacks > 0 {
         True ->
           PlayerMatchState(
-            ..player1_state,
+            ..player1,
             chosen_card: Some(Attack),
-            hand: Hand(..player1_state.hand, attacks: { attacks - 1 }),
+            hand: Hand(..player1.hand, attacks: { attacks - 1 }),
           )
-        False -> player1_state
+        False -> player1
       }
     }
     Counter -> {
-      let counters = player1_state.hand.counters
+      let counters = player1.hand.counters
       case counters > 0 {
         True -> {
           PlayerMatchState(
-            ..player1_state,
+            ..player1,
             chosen_card: Some(Counter),
-            hand: Hand(..player1_state.hand, counters: { counters - 1 }),
+            hand: Hand(..player1.hand, counters: { counters - 1 }),
           )
         }
-        False -> player1_state
+        False -> player1
       }
     }
     Rest -> {
-      let rests = player1_state.hand.rests
+      let rests = player1.hand.rests
       case rests > 0 {
         True ->
           PlayerMatchState(
-            ..player1_state,
+            ..player1,
             chosen_card: Some(Rest),
-            hand: Hand(..player1_state.hand, rests: { rests - 1 }),
+            hand: Hand(..player1.hand, rests: { rests - 1 }),
           )
-        False -> player1_state
+        False -> player1
       }
     }
   }
-  case player1_state.chosen_card, player2_state.chosen_card {
+  case player1.chosen_card, player2.chosen_card {
     Some(player1_card), Some(player2_card) -> {
       let card_rewards_player1 = get_card_rewards(player1_card, player2_card)
       let card_rewards_player2 = get_card_rewards(player2_card, player1_card)
-      // for now just add all the new cards, need to add an intermediate state
-      // where the players are choosing their reward later to limit it to 1
-      // each round.
-      let player1_state =
-        remove_current_card(player1_state)
+
+      let player1 =
+        remove_current_card(player1)
         |> apply_hp_diff(get_hp_diff(player1_card, player2_card))
-        |> list.fold(card_rewards_player1, _, add_card_to_hand)
+        |> apply_card_rewards(card_rewards_player1)
 
-      let player2_state =
-        remove_current_card(player2_state)
+      let player2 =
+        remove_current_card(player2)
         |> apply_hp_diff(get_hp_diff(player2_card, player1_card))
-        |> list.fold(card_rewards_player2, _, add_card_to_hand)
+        |> apply_card_rewards(card_rewards_player2)
 
-      case player1_state.health, player2_state.health {
+      case player1.health, player2.health {
         0, 0 ->
-          Ok(#(match_id, Finished(PlayerIdPair(player1_id, player2_id), Draw)))
+          Ok(#(match_id, Finished(PlayerIdPair(player1.id, player2.id), Draw)))
         0, _ ->
           Ok(#(
             match_id,
-            Finished(PlayerIdPair(player1_id, player2_id), Victory(player2_id)),
+            Finished(PlayerIdPair(player1.id, player2.id), Victory(player2.id)),
           ))
         _, 0 ->
           Ok(#(
             match_id,
-            Finished(PlayerIdPair(player1_id, player2_id), Victory(player1_id)),
+            Finished(PlayerIdPair(player1.id, player2.id), Victory(player1.id)),
           ))
         _, _ ->
           Ok(#(
             match_id,
-            ResolvingRound(PlayerIdPair(player1_id, player2_id), [
-              #(player1_id, player1_state),
-              #(player2_id, player2_state),
+            ResolvingRound(PlayerIdPair(player1.id, player2.id), [
+              player1,
+              player2,
             ]),
           ))
       }
@@ -642,10 +734,7 @@ fn handle_play_card(
     Some(_), None ->
       Ok(#(
         match_id,
-        ResolvingRound(PlayerIdPair(player1_id, player2_id), [
-          #(player1_id, player1_state),
-          #(player2_id, player2_state),
-        ]),
+        ResolvingRound(PlayerIdPair(player1.id, player2.id), [player1, player2]),
       ))
   }
 }
@@ -669,25 +758,6 @@ fn add_card_to_hand(state, card) {
       )
   }
 }
-
-// fn resolve_round(
-//   player1_state: PlayerMatchState,
-//   player1_card: Card,
-//   player2_state: PlayerMatchState,
-//   player2_card: Card,
-// ) {
-//   let card_rewards_player1 = get_card_rewards(player1_card, player2_card)
-//   let card_rewards_player2 = get_card_rewards(player2_card, player1_card)
-//   let player1_state =
-//     apply_hp_diff(player1_state, get_hp_diff(player1_card, player2_card))
-//   let player2_state =
-//     apply_hp_diff(player2_state, get_hp_diff(player2_card, player1_card))
-//
-//   #(#(card_rewards_player1, player1_state), #(
-//     card_rewards_player2,
-//     player2_state,
-//   ))
-// }
 
 fn get_hp_diff(player_card, opponent_card) {
   // Could "simplify" this into two cases: one that returns -1 and one that
@@ -713,20 +783,35 @@ fn remove_current_card(state) {
   PlayerMatchState(..state, chosen_card: None)
 }
 
+fn apply_card_rewards(state: PlayerMatchState, choices) {
+  list.fold(choices, state, fn(state, card_choice) {
+    case card_choice {
+      CardReward(card) -> add_card_to_hand(state, card)
+      CardRewardChoice(card1, card2) ->
+        PlayerMatchState(..state, unresolved_card_choice: Some([card1, card2]))
+    }
+  })
+}
+
+type CardReward {
+  CardReward(Card)
+  CardRewardChoice(a: Card, b: Card)
+}
+
 /// Returns a list of card rewards to choose from. If the length of the list is
 /// less than 2 then there is no choice and you would automatically get the
 /// card.
-fn get_card_rewards(player_card, opponent_card) {
+fn get_card_rewards(player_card, opponent_card) -> List(CardReward) {
   case player_card, opponent_card {
     Attack, Attack -> []
     Attack, Counter -> []
     Attack, Rest -> []
-    Counter, Attack -> [Counter]
+    Counter, Attack -> [CardReward(Counter)]
     Counter, Counter -> []
     Counter, Rest -> []
-    Rest, Attack -> [Attack, Rest]
-    Rest, Counter -> [Attack, Counter, Rest]
-    Rest, Rest -> [Attack, Counter, Rest]
+    Rest, Attack -> [CardReward(Attack), CardReward(Rest)]
+    Rest, Counter -> [CardRewardChoice(Attack, Counter), CardReward(Rest)]
+    Rest, Rest -> [CardRewardChoice(Attack, Counter), CardReward(Rest)]
   }
 }
 
@@ -775,8 +860,6 @@ fn result_to_json(result: RoundResult) -> json.Json {
         #("resultType", json.string("victory")),
         #("winner", json.int(winner)),
       ])
-    ChooseCard(options) ->
-      json.object([#("options", json.array(options, card_to_json))])
     NextRound(player, opponent) ->
       json.object([
         #(
@@ -792,6 +875,10 @@ fn result_to_json(result: RoundResult) -> json.Json {
             ),
             #("chosen_card", maybe_card_to_json(player.chosen_card)),
             #("health", json.int(player.health)),
+            #("cardChoices", case player.unresolved_card_choice {
+              Some(options) -> json.array(options, card_to_json)
+              None -> json.null()
+            }),
           ]),
         ),
         #(
@@ -805,12 +892,16 @@ fn result_to_json(result: RoundResult) -> json.Json {
   }
 }
 
-fn card_to_json(card: Card) -> json.Json {
+fn card_to_string(card: Card) {
   case card {
-    Attack -> json.string("attack")
-    Counter -> json.string("counter")
-    Rest -> json.string("rest")
+    Attack -> "attack"
+    Counter -> "counter"
+    Rest -> "rest"
   }
+}
+
+fn card_to_json(card: Card) -> json.Json {
+  json.string(card_to_string(card))
 }
 
 fn maybe_card_to_json(card: Option(Card)) -> json.Json {
@@ -863,29 +954,15 @@ fn decode_ws_message(
       )
     Ok(#("playCard", msg)) ->
       msg
-      |> dynamic.decode1(
-        PlayCard,
-        dynamic.field("card", fn(card) {
-          dynamic.string(card)
-          |> result.then(fn(card_str) {
-            case card_str {
-              "attack" -> Ok(Attack)
-              "counter" -> Ok(Counter)
-              "rest" -> Ok(Rest)
-              other ->
-                Error([
-                  dynamic.DecodeError("attack | counter | rest", other, [
-                    "message", "card",
-                  ]),
-                ])
-            }
-          })
-        }),
-      )
+      |> dynamic.decode1(PlayCard, dynamic.field("card", decode_card_json))
+    Ok(#("pickCard", msg)) ->
+      msg
+      |> dynamic.decode1(PickCard, dynamic.field("card", decode_card_json))
+
     Ok(#(found, _)) ->
       Error([
         dynamic.DecodeError(
-          "chat | challenge | challengeResponse | playCard",
+          "chat | challenge | challengeResponse | playCard | pickCard",
           found,
           [],
         ),
@@ -896,6 +973,23 @@ fn decode_ws_message(
       Error([dynamic.DecodeError(byte, "", [])])
     Error(_) -> Error([dynamic.DecodeError("chat or broadcast", "", [])])
   }
+}
+
+fn decode_card_json(card) {
+  dynamic.string(card)
+  |> result.then(fn(card_str) {
+    case card_str {
+      "attack" -> Ok(Attack)
+      "counter" -> Ok(Counter)
+      "rest" -> Ok(Rest)
+      other ->
+        Error([
+          dynamic.DecodeError("attack | counter | rest", other, [
+            "message", "card",
+          ]),
+        ])
+    }
+  })
 }
 
 type WsMsgError {
