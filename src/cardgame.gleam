@@ -775,7 +775,8 @@ fn result_to_json(result: RoundResult) -> json.Json {
         #("resultType", json.string("victory")),
         #("winner", json.int(winner)),
       ])
-    ChooseCard(_) -> todo
+    ChooseCard(options) ->
+      json.object([#("options", json.array(options, card_to_json))])
     NextRound(player, opponent) ->
       json.object([
         #(
@@ -789,7 +790,7 @@ fn result_to_json(result: RoundResult) -> json.Json {
                 #("rests", json.int(player.hand.rests)),
               ]),
             ),
-            #("chosen_card", card_to_json(player.chosen_card)),
+            #("chosen_card", maybe_card_to_json(player.chosen_card)),
             #("health", json.int(player.health)),
           ]),
         ),
@@ -804,11 +805,17 @@ fn result_to_json(result: RoundResult) -> json.Json {
   }
 }
 
-fn card_to_json(card: Option(Card)) -> json.Json {
+fn card_to_json(card: Card) -> json.Json {
   case card {
-    Some(Attack) -> json.string("attack")
-    Some(Counter) -> json.string("counter")
-    Some(Rest) -> json.string("rest")
+    Attack -> json.string("attack")
+    Counter -> json.string("counter")
+    Rest -> json.string("rest")
+  }
+}
+
+fn maybe_card_to_json(card: Option(Card)) -> json.Json {
+  case card {
+    Some(card) -> card_to_json(card)
     None -> json.null()
   }
 }
