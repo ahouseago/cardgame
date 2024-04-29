@@ -59,7 +59,10 @@ pub fn main() {
   // These values are for the Websocket process initialized below
   // let selector = process.new_selector()
   let assert Ok(state_subject) =
-    actor.start(game.State(players: dict.new(), matches: dict.new()), handle_message)
+    actor.start(
+      game.State(players: dict.new(), matches: dict.new()),
+      handle_message,
+    )
 
   let not_found =
     response.new(404)
@@ -273,14 +276,14 @@ fn handle_message_from_client(
           let new_state =
             game.State(
               players: dict.insert(
-                  state.players,
-                  challenger.id,
-                  game.Player(..challenger, phase: InMatch(match_id)),
-                )
+                state.players,
+                challenger.id,
+                game.Player(..challenger, phase: InMatch(match_id)),
+              )
                 |> dict.insert(
-                  origin_player.id,
-                  game.Player(..origin_player, phase: InMatch(match_id)),
-                ),
+                origin_player.id,
+                game.Player(..origin_player, phase: InMatch(match_id)),
+              ),
               matches: dict.insert(
                 state.matches,
                 match_id,
@@ -361,7 +364,7 @@ fn handle_message_from_client(
         Ok(match_state) -> {
           let #(match_id, new_match_state) = match_state
 
-          case game.get_round_results(new_match_state) {
+          let _ = case game.get_round_results(new_match_state) {
             [#(id1, result1), #(id2, result2)] -> {
               let _ =
                 state.players
@@ -423,7 +426,8 @@ fn handle_message_from_client(
               == origin_player.id ->
               game.handle_pick_card(match_id, player, choice, opponent)
               |> result.map_error(convert_to_ws_error)
-            Ok(game.ResolvingRound(_, _)) -> Error(InvalidRequest("bad match state"))
+            Ok(game.ResolvingRound(_, _)) ->
+              Error(InvalidRequest("bad match state"))
             Error(_) -> Error(InvalidRequest("match not found"))
           }
         }
@@ -502,11 +506,11 @@ fn msg_to_json(msg) {
         #(
           "phase",
           case phase {
-              Idle -> "idle"
-              Challenging(id) ->
-                "waiting for challenge response from " <> int.to_string(id)
-              InMatch(id) -> "in a match with " <> int.to_string(id)
-            }
+            Idle -> "idle"
+            Challenging(id) ->
+              "waiting for challenge response from " <> int.to_string(id)
+            InMatch(id) -> "in a match with " <> int.to_string(id)
+          }
             |> json.string,
         ),
       ]),
