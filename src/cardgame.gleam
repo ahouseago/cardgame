@@ -35,6 +35,7 @@ type IndividualConnMessage {
   Publish(OutgoingMessage)
   CreatedPlayer(Player(Subject(IndividualConnMessage)))
   Incoming(String)
+  Shutdown
 }
 
 type IncomingMessage {
@@ -75,7 +76,9 @@ pub fn main() {
           mist.websocket(
             request: req,
             on_init: on_init(state_subject),
-            on_close: fn(_state) { io.println("goodbye!") },
+            on_close: fn(ws_conn_subject) {
+              actor.send(ws_conn_subject, Shutdown)
+            },
             handler: handle_ws_message,
           )
 
@@ -95,7 +98,12 @@ fn on_init(state_subj) {
     let assert Ok(connection_subj) =
       actor.start(Initialising(conn), fn(msg, connection_state) {
         case msg {
-          CreatedPlayer(player) -> actor.continue(Created(player, conn))
+          CreatedPlayer(player) -> {
+            io.println(
+              "Player " <> int.to_string(player.id) <> " has connected.",
+            )
+            actor.continue(Created(player, conn))
+          }
           Incoming(text) -> {
             case connection_state {
               Created(player, _) -> {
@@ -109,6 +117,17 @@ fn on_init(state_subj) {
             let assert Ok(_) =
               mist.send_text_frame(conn, encode(outgoing_message))
             actor.continue(connection_state)
+          }
+          Shutdown -> {
+            case connection_state {
+              Created(player, _) -> {
+                io.println(
+                  "Player " <> int.to_string(player.id) <> " has disconnected.",
+                )
+              }
+              _ -> Nil
+            }
+            actor.Stop(process.Normal)
           }
         }
       })
@@ -437,7 +456,7 @@ fn handle_message_from_client(
         Ok(match_state) -> {
           let #(match_id, new_match_state) = match_state
 
-          case game.get_round_results(new_match_state) {
+          let _ = case game.get_round_results(new_match_state) {
             [#(id1, result1), #(id2, result2)] -> {
               let _ =
                 state.players
