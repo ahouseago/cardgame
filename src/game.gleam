@@ -16,6 +16,7 @@ pub type Phase {
 
 pub type State(player_conn_subj) {
   State(
+    next_id: Int,
     players: Dict(Int, Player(player_conn_subj)),
     matches: Dict(Int, MatchState),
   )

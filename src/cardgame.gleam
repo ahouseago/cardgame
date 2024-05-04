@@ -61,7 +61,7 @@ pub fn main() {
   // let selector = process.new_selector()
   let assert Ok(state_subject) =
     actor.start(
-      game.State(players: dict.new(), matches: dict.new()),
+      game.State(next_id: 0, players: dict.new(), matches: dict.new()),
       handle_message,
     )
 
@@ -121,6 +121,7 @@ fn on_init(state_subj) {
           Shutdown -> {
             case connection_state {
               Created(player, _) -> {
+                actor.send(state_subj, Delete(player.id))
                 io.println(
                   "Player " <> int.to_string(player.id) <> " has disconnected.",
                 )
@@ -156,18 +157,23 @@ fn handle_ws_message(ws_conn_subject, conn, message) {
   }
 }
 
+fn get_next_id(state: game.State(a)) {
+  let id = state.next_id
+  #(game.State(..state, next_id: id + 1), id)
+}
+
 fn handle_message(
   msg: ConnectionMsg,
   state: game.State(Subject(IndividualConnMessage)),
 ) -> actor.Next(ConnectionMsg, game.State(Subject(IndividualConnMessage))) {
   case msg {
     Create(conn_subj) -> {
-      let id = dict.size(state.players)
+      let #(state, id) = get_next_id(state)
       let player = game.Player(id, conn_subj, Idle)
       actor.send(conn_subj, CreatedPlayer(player))
-      let new_state =
+      let state =
         game.State(..state, players: dict.insert(state.players, id, player))
-      actor.continue(new_state)
+      actor.continue(state)
     }
     Delete(id) ->
       game.State(..state, players: dict.delete(state.players, id))
@@ -294,15 +300,16 @@ fn handle_message_from_client(
           let match_id = dict.size(state.matches)
           let new_state =
             game.State(
+              ..state,
               players: dict.insert(
-                state.players,
-                challenger.id,
-                game.Player(..challenger, phase: InMatch(match_id)),
-              )
+                  state.players,
+                  challenger.id,
+                  game.Player(..challenger, phase: InMatch(match_id)),
+                )
                 |> dict.insert(
-                origin_player.id,
-                game.Player(..origin_player, phase: InMatch(match_id)),
-              ),
+                  origin_player.id,
+                  game.Player(..origin_player, phase: InMatch(match_id)),
+                ),
               matches: dict.insert(
                 state.matches,
                 match_id,
@@ -419,10 +426,13 @@ fn handle_message_from_client(
             _ -> state.players
           }
 
-          actor.continue(game.State(
-            players: players,
-            matches: dict.insert(state.matches, match_id, new_match_state),
-          ))
+          actor.continue(
+            game.State(
+              ..state,
+              players: players,
+              matches: dict.insert(state.matches, match_id, new_match_state),
+            ),
+          )
         }
         Error(ws_err) -> {
           actor.send(
@@ -492,10 +502,13 @@ fn handle_message_from_client(
             _ -> state.players
           }
 
-          actor.continue(game.State(
-            players: players,
-            matches: dict.insert(state.matches, match_id, new_match_state),
-          ))
+          actor.continue(
+            game.State(
+              ..state,
+              players: players,
+              matches: dict.insert(state.matches, match_id, new_match_state),
+            ),
+          )
         }
         Error(ws_err) -> {
           actor.send(
