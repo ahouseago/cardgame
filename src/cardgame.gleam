@@ -54,6 +54,7 @@ type OutgoingMessage {
   Challenge(from: Int)
   ChallengeAccepted
   RoundResult(game.RoundResult)
+  Connected(id: Int)
 }
 
 pub fn main() {
@@ -171,6 +172,7 @@ fn handle_message(
       let #(state, id) = get_next_id(state)
       let player = game.Player(id, conn_subj, Idle)
       actor.send(conn_subj, CreatedPlayer(player))
+      actor.send(conn_subj, Publish(Connected(id)))
       let state =
         game.State(..state, players: dict.insert(state.players, id, player))
       actor.continue(state)
@@ -548,6 +550,7 @@ fn msg_to_json(msg) {
       ]),
     )
     RoundResult(result) -> #("result", game.result_to_json(result))
+    Connected(id) -> #("connected", json.int(id))
   }
   |> pair.map_first(json.string)
 }
