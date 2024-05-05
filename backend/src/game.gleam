@@ -1,17 +1,14 @@
 import card.{type Card, Attack, Counter, Rest}
 import gleam/dict.{type Dict}
-import gleam/json
 import gleam/list
-import gleam/option.{type Option, None, Some}
-
-pub type Player(conn_subj) {
-  Player(id: Int, conn_subj: conn_subj, phase: Phase)
+import gleam/option.{None, Some}
+import messaging.{
+  type MatchState, Draw, Finished, Hand, MatchEnded, NextRound,
+  OpponentMatchState, PlayerIdPair, PlayerMatchState, ResolvingRound, Victory,
 }
 
-pub type Phase {
-  Idle
-  Challenging(opponent_id: Int)
-  InMatch(match_id: Int)
+pub type Player(conn_subj) {
+  Player(id: Int, conn_subj: conn_subj, phase: messaging.GamePhase)
 }
 
 pub type State(player_conn_subj) {
@@ -20,25 +17,6 @@ pub type State(player_conn_subj) {
     players: Dict(Int, Player(player_conn_subj)),
     matches: Dict(Int, MatchState),
   )
-}
-
-pub type Hand {
-  Hand(attacks: Int, counters: Int, rests: Int)
-}
-
-pub type PlayerMatchState {
-  PlayerMatchState(
-    // Player ID
-    id: Int,
-    hand: Hand,
-    chosen_card: Option(Card),
-    health: Int,
-    unresolved_card_choice: Option(List(Card)),
-  )
-}
-
-pub type OpponentMatchState {
-  OpponentMatchState(num_cards: Int, health: Int)
 }
 
 fn initial_player_state(id) {
@@ -51,20 +29,6 @@ fn initial_player_state(id) {
   )
 }
 
-pub type EndState {
-  Draw
-  Victory(winner: Int)
-}
-
-pub type PlayerIdPair {
-  PlayerIdPair(Int, Int)
-}
-
-pub type MatchState {
-  ResolvingRound(PlayerIdPair, List(PlayerMatchState))
-  Finished(PlayerIdPair, EndState)
-}
-
 pub fn new_match(id1, id2) {
   ResolvingRound(PlayerIdPair(id1, id2), [
     initial_player_state(id1),
@@ -72,13 +36,13 @@ pub fn new_match(id1, id2) {
   ])
 }
 
-pub type RoundResult {
-  MatchEnded(EndState)
-  NextRound(you: PlayerMatchState, opponent: OpponentMatchState)
-}
-
 pub type GameError {
   GameError(String)
+}
+
+pub fn convert_to_ws_error(err) {
+  let GameError(reason) = err
+  messaging.InvalidRequest(reason)
 }
 
 pub fn get_round_results(match_state: MatchState) {
@@ -112,14 +76,19 @@ pub fn get_round_results(match_state: MatchState) {
   }
 }
 
-fn to_opponent_state(state: PlayerMatchState) -> OpponentMatchState {
+fn to_opponent_state(
+  state: messaging.PlayerMatchState,
+) -> messaging.OpponentMatchState {
   let num_cards = state.hand.attacks + state.hand.counters + state.hand.rests
   OpponentMatchState(num_cards: num_cards, health: state.health)
 }
 
 // check_no_unresolved_choices returns an error if the provided state has
 // unresolved card choices.
-pub fn check_no_unresolved_choices(player_state: PlayerMatchState, ok_state) {
+pub fn check_no_unresolved_choices(
+  player_state: messaging.PlayerMatchState,
+  ok_state,
+) {
   case player_state.unresolved_card_choice {
     None | Some([]) -> ok_state
     Some([_, ..]) ->
@@ -129,9 +98,9 @@ pub fn check_no_unresolved_choices(player_state: PlayerMatchState, ok_state) {
 
 pub fn handle_pick_card(
   match_id: Int,
-  player_state: PlayerMatchState,
+  player_state: messaging.PlayerMatchState,
   choice: Card,
-  opponent_state: PlayerMatchState,
+  opponent_state: messaging.PlayerMatchState,
 ) {
   case player_state.unresolved_card_choice {
     None | Some([]) -> Error(GameError("no card choices to pick"))
@@ -161,9 +130,9 @@ pub fn handle_pick_card(
 
 pub fn handle_play_card(
   match_id: Int,
-  player1: PlayerMatchState,
+  player1: messaging.PlayerMatchState,
   player1_card: Card,
-  player2: PlayerMatchState,
+  player2: messaging.PlayerMatchState,
 ) -> Result(#(Int, MatchState), GameError) {
   let current_chosen_card = player1.chosen_card
 
@@ -321,7 +290,7 @@ fn remove_current_card(state) {
   PlayerMatchState(..state, chosen_card: None)
 }
 
-fn apply_card_rewards(state: PlayerMatchState, choices) {
+fn apply_card_rewards(state: messaging.PlayerMatchState, choices) {
   list.fold(choices, state, fn(state, card_choice) {
     case card_choice {
       CardReward(card) -> add_card_to_hand(state, card)
@@ -350,45 +319,5 @@ fn get_card_rewards(player_card, opponent_card) -> List(CardReward) {
     Rest, Attack -> [CardReward(Attack), CardReward(Rest)]
     Rest, Counter -> [CardRewardChoice(Attack, Counter), CardReward(Rest)]
     Rest, Rest -> [CardRewardChoice(Attack, Counter), CardReward(Rest)]
-  }
-}
-
-pub fn result_to_json(result: RoundResult) -> json.Json {
-  case result {
-    MatchEnded(Draw) -> json.object([#("resultType", json.string("draw"))])
-    MatchEnded(Victory(winner)) ->
-      json.object([
-        #("resultType", json.string("victory")),
-        #("winner", json.int(winner)),
-      ])
-    NextRound(player, opponent) ->
-      json.object([
-        #(
-          "player",
-          json.object([
-            #(
-              "hand",
-              json.object([
-                #("attacks", json.int(player.hand.attacks)),
-                #("counters", json.int(player.hand.counters)),
-                #("rests", json.int(player.hand.rests)),
-              ]),
-            ),
-            #("chosen_card", card.maybe_to_json(player.chosen_card)),
-            #("health", json.int(player.health)),
-            #("cardChoices", case player.unresolved_card_choice {
-              Some(options) -> json.array(options, card.to_json)
-              None -> json.null()
-            }),
-          ]),
-        ),
-        #(
-          "opponent",
-          json.object([
-            #("cardCount", json.int(opponent.num_cards)),
-            #("health", json.int(opponent.health)),
-          ]),
-        ),
-      ])
   }
 }

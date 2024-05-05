@@ -2,3 +2,6 @@
 *.ez
 /build
 erl_crash.dump
+/backend/build
+/client/build
+/shared/build
