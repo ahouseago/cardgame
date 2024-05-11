@@ -1,6 +1,7 @@
 import gleam/int
 import gleam/io
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import lustre
 import lustre/attribute
 import lustre/effect
@@ -10,8 +11,17 @@ import lustre/event
 import lustre_websocket as ws
 import messaging
 
+type ChatBox {
+  ChatBox(to: Option(Int), message: String)
+}
+
 type Model {
-  Connected(socket: ws.WebSocket, id: Int, messages: List(String))
+  Connected(
+    socket: ws.WebSocket,
+    id: Option(Int),
+    messages: List(String),
+    chatbox: ChatBox,
+  )
   Disconnected
 }
 
@@ -24,6 +34,7 @@ type Msg {
   Err(String)
   SendMessage(messaging.IncomingMessage)
   SendChatMessage
+  UpdateChatBox(ChatBox)
 }
 
 fn init(_flags) {
@@ -73,37 +84,49 @@ fn update(model: Model, msg: Msg) -> #(Model, effect.Effect(Msg)) {
   case model, msg {
     _, Connect -> #(model, init_ws())
     _, WsConnected(socket) -> #(
-      Connected(socket: socket, id: 0, messages: []),
+      Connected(
+        socket: socket,
+        id: None,
+        messages: [],
+        chatbox: ChatBox(None, ""),
+      ),
       effect.none(),
     )
-    Connected(socket, id, msgs), RecieveTextMessage(msg) -> {
+    Connected(socket, id, msgs, chatbox), RecieveTextMessage(msg) -> {
       case msg {
         messaging.Err(err_string) -> #(
-          Connected(socket, id, [err_string, ..msgs]),
+          Connected(socket, id, [err_string, ..msgs], chatbox),
           effect.none(),
         )
         messaging.PhaseUpdate(phase) -> todo
         messaging.Direct(from, message) -> #(
-          Connected(socket, id, [
-            "from " <> int.to_string(from) <> ": " <> message,
-            ..msgs
-          ]),
+          Connected(
+            socket,
+            id,
+            ["from " <> int.to_string(from) <> ": " <> message, ..msgs],
+            chatbox,
+          ),
           effect.none(),
         )
         messaging.Broadcast(message) -> #(
-          Connected(socket, id, ["broadcast: " <> message, ..msgs]),
+          Connected(socket, id, ["broadcast: " <> message, ..msgs], chatbox),
           effect.none(),
         )
         messaging.Challenge(from) -> #(
-          Connected(socket, id, [
-            int.to_string(from) <> " has challenged you!",
-            ..msgs
-          ]),
+          Connected(
+            socket,
+            id,
+            [int.to_string(from) <> " has challenged you!", ..msgs],
+            chatbox,
+          ),
           effect.none(),
         )
         messaging.ChallengeAccepted -> todo
         messaging.RoundResult(result) -> todo
-        messaging.Connected(id) -> #(Connected(socket, id, msgs), effect.none())
+        messaging.Connected(id) -> #(
+          Connected(socket, Some(id), msgs, chatbox),
+          effect.none(),
+        )
       }
     }
     _, Err(msg) -> {
@@ -113,21 +136,25 @@ fn update(model: Model, msg: Msg) -> #(Model, effect.Effect(Msg)) {
     _, RecieveTextMessage(_) -> #(model, effect.none())
     _, Disconnect -> #(model, effect.none())
     _, FailedToConnect -> #(model, effect.none())
-    Connected(socket, _, _), SendMessage(msg) -> #(
+    Connected(socket, _, _, _), SendMessage(msg) -> #(
       model,
       ws.send(socket, messaging.incoming_to_json(msg)),
     )
     _, SendMessage(_) -> #(model, effect.none())
-    Connected(socket, _, _), SendChatMessage -> #(
+    Connected(socket, _, _, ChatBox(Some(recipient_id), msg)), SendChatMessage -> #(
       model,
-      ws.send(socket, messaging.incoming_to_json(chat_message(model))),
+      ws.send(
+        socket,
+        messaging.incoming_to_json(messaging.Chat(recipient_id, msg)),
+      ),
     )
     _, SendChatMessage -> #(model, effect.none())
+    Connected(socket, id, msgs, _), UpdateChatBox(chatbox) -> #(
+      Connected(socket, id, msgs, chatbox: chatbox),
+      effect.none(),
+    )
+    _, UpdateChatBox(_) -> #(model, effect.none())
   }
-}
-
-fn chat_message(model: Model) -> messaging.IncomingMessage {
-  todo as "get the text and recipient from the model (currently isn't added)"
 }
 
 fn view(model: Model) {
@@ -139,7 +166,7 @@ fn view(model: Model) {
           element.text("Connect to server"),
         ]),
       ])
-    Connected(_socket, id, msgs) ->
+    Connected(_socket, Some(id), msgs, chatbox) ->
       html.body([], [
         html.h1([], [element.text("Welcome player " <> int.to_string(id))]),
         html.ul(
@@ -148,16 +175,27 @@ fn view(model: Model) {
         ),
         html.form([event.on_submit(SendChatMessage)], [
           html.input([
-            event.on_input(send_message(id, _)),
+            event.on_input(fn(id_str) {
+              case int.parse(id_str) {
+                Ok(id) -> UpdateChatBox(ChatBox(Some(id), chatbox.message))
+                Error(_) -> Err("parsing new recipient ID")
+              }
+            }),
+            attribute.type_("number"),
+            attribute.min("0"),
+          ]),
+          html.input([
+            event.on_input(fn(msg) {
+              UpdateChatBox(ChatBox(message: msg, to: chatbox.to))
+            }),
             attribute.placeholder("Enter your message..."),
           ]),
+          html.input([attribute.type_("submit"), attribute.value("Send")]),
         ]),
       ])
+    Connected(_socket, None, _, _) ->
+      html.div([], [html.h1([], [element.text("Connecting...")])])
   }
-}
-
-fn send_message(id, msg) {
-  SendMessage(messaging.Chat(id, msg))
 }
 
 pub fn main() {
